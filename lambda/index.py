@@ -1,75 +1,63 @@
 # lambda/index.py
+
 import json
 import os
-import boto3
-import re  # 正規表現モジュールをインポート
-from botocore.exceptions import ClientError
+import re
+import urllib.request
+import urllib.error
+import datetime
+import hashlib
+import hmac
 
-
-# Lambda コンテキストからリージョンを抽出する関数
+# ARN からリージョンを抽出
 def extract_region_from_arn(arn):
-    # ARN 形式: arn:aws:lambda:region:account-id:function:function-name
-    match = re.search('arn:aws:lambda:([^:]+):', arn)
-    if match:
-        return match.group(1)
-    return "us-east-1"  # デフォルト値
+    match = re.search(r'arn:aws:lambda:([^:]+):', arn)
+    return match.group(1) if match else "us-east-1"
 
-# グローバル変数としてクライアントを初期化（初期値）
-bedrock_client = None
+# SigV4 用 HMAC-SHA256
+def sign(key, msg):
+    return hmac.new(key, msg.encode('utf-8'), hashlib.sha256).digest()
 
-# モデルID
+# 署名鍵の生成
+def get_signature_key(key, date_stamp, region, service):
+    k_date = sign(('AWS4' + key).encode('utf-8'), date_stamp)
+    k_region = sign(k_date, region)
+    k_service = sign(k_region, service)
+    k_signing = sign(k_service, 'aws4_request')
+    return k_signing
+
+# 環境変数からモデルIDを取得
 MODEL_ID = os.environ.get("MODEL_ID", "us.amazon.nova-lite-v1:0")
 
 def lambda_handler(event, context):
     try:
-        # コンテキストから実行リージョンを取得し、クライアントを初期化
-        global bedrock_client
-        if bedrock_client is None:
-            region = extract_region_from_arn(context.invoked_function_arn)
-            bedrock_client = boto3.client('bedrock-runtime', region_name=region)
-            print(f"Initialized Bedrock client in region: {region}")
-        
-        print("Received event:", json.dumps(event))
-        
-        # Cognitoで認証されたユーザー情報を取得
-        user_info = None
-        if 'requestContext' in event and 'authorizer' in event['requestContext']:
-            user_info = event['requestContext']['authorizer']['claims']
-            print(f"Authenticated user: {user_info.get('email') or user_info.get('cognito:username')}")
-        
+        # 実行リージョンとエンドポイント
+        region = extract_region_from_arn(context.invoked_function_arn)
+        host = f"bedrock-runtime.{region}.amazonaws.com"
+        endpoint = f"https://{host}/model/{MODEL_ID}/invoke"
+
+        # Lambda 実行ロールの一時認証情報
+        access_key = os.environ.get('AWS_ACCESS_KEY_ID')
+        secret_key = os.environ.get('AWS_SECRET_ACCESS_KEY')
+        session_token = os.environ.get('AWS_SESSION_TOKEN')
+        if not access_key or not secret_key:
+            raise Exception("AWS credentials not found in environment")
+
         # リクエストボディの解析
-        body = json.loads(event['body'])
+        body = json.loads(event.get('body', '{}'))
         message = body['message']
         conversation_history = body.get('conversationHistory', [])
-        
-        print("Processing message:", message)
-        print("Using model:", MODEL_ID)
-        
-        # 会話履歴を使用
         messages = conversation_history.copy()
-        
-        # ユーザーメッセージを追加
-        messages.append({
-            "role": "user",
-            "content": message
-        })
-        
-        # Nova Liteモデル用のリクエストペイロードを構築
-        # 会話履歴を含める
+        messages.append({ "role": "user", "content": message })
+
+        # Bedrock 用メッセージ形式に変換
         bedrock_messages = []
         for msg in messages:
-            if msg["role"] == "user":
-                bedrock_messages.append({
-                    "role": "user",
-                    "content": [{"text": msg["content"]}]
-                })
-            elif msg["role"] == "assistant":
-                bedrock_messages.append({
-                    "role": "assistant", 
-                    "content": [{"text": msg["content"]}]
-                })
-        
-        # invoke_model用のリクエストペイロード
+            bedrock_messages.append({
+                "role": msg["role"],
+                "content": [ { "text": msg["content"] } ]
+            })
+
         request_payload = {
             "messages": bedrock_messages,
             "inferenceConfig": {
@@ -79,34 +67,79 @@ def lambda_handler(event, context):
                 "topP": 0.9
             }
         }
-        
-        print("Calling Bedrock invoke_model API with payload:", json.dumps(request_payload))
-        
-        # invoke_model APIを呼び出し
-        response = bedrock_client.invoke_model(
-            modelId=MODEL_ID,
-            body=json.dumps(request_payload),
-            contentType="application/json"
+        request_body = json.dumps(request_payload, separators=(',', ':'))
+
+        # --- SigV4 署名の準備 ---
+        t = datetime.datetime.utcnow()
+        amz_date = t.strftime('%Y%m%dT%H%M%SZ')
+        date_stamp = t.strftime('%Y%m%d')
+        service = 'bedrock-runtime'
+        method = 'POST'
+        canonical_uri = f"/model/{MODEL_ID}/invoke"
+        canonical_querystring = ''
+        payload_hash = hashlib.sha256(request_body.encode('utf-8')).hexdigest()
+        canonical_headers = (
+            f"content-type:application/json\n"
+            f"host:{host}\n"
+            f"x-amz-date:{amz_date}\n"
         )
-        
-        # レスポンスを解析
-        response_body = json.loads(response['body'].read())
-        print("Bedrock response:", json.dumps(response_body, default=str))
-        
-        # 応答の検証
-        if not response_body.get('output') or not response_body['output'].get('message') or not response_body['output']['message'].get('content'):
+        signed_headers = 'content-type;host;x-amz-date'
+        canonical_request = '\n'.join([
+            method,
+            canonical_uri,
+            canonical_querystring,
+            canonical_headers,
+            signed_headers,
+            payload_hash
+        ])
+
+        algorithm = 'AWS4-HMAC-SHA256'
+        credential_scope = f"{date_stamp}/{region}/{service}/aws4_request"
+        string_to_sign = '\n'.join([
+            algorithm,
+            amz_date,
+            credential_scope,
+            hashlib.sha256(canonical_request.encode('utf-8')).hexdigest()
+        ])
+
+        signing_key = get_signature_key(secret_key, date_stamp, region, service)
+        signature = hmac.new(signing_key, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
+        authorization_header = (
+            f"{algorithm} Credential={access_key}/{credential_scope}, "
+            f"SignedHeaders={signed_headers}, Signature={signature}"
+        )
+
+        # HTTP ヘッダー
+        headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'Host': host,
+            'X-Amz-Date': amz_date,
+            'Authorization': authorization_header,
+        }
+        if session_token:
+            headers['X-Amz-Security-Token'] = session_token
+
+        # API 呼び出し
+        req = urllib.request.Request(
+            endpoint,
+            data=request_body.encode('utf-8'),
+            headers=headers,
+            method='POST'
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp_body = resp.read()
+        response_body = json.loads(resp_body)
+
+        # レスポンス検証
+        output = response_body.get('output', {})
+        content_list = output.get('message', {}).get('content', [])
+        if not content_list:
             raise Exception("No response content from the model")
-        
-        # アシスタントの応答を取得
-        assistant_response = response_body['output']['message']['content'][0]['text']
-        
-        # アシスタントの応答を会話履歴に追加
-        messages.append({
-            "role": "assistant",
-            "content": assistant_response
-        })
-        
-        # 成功レスポンスの返却
+
+        assistant_response = content_list[0].get('text', '')
+        messages.append({ "role": "assistant", "content": assistant_response })
+
         return {
             "statusCode": 200,
             "headers": {
@@ -121,10 +154,25 @@ def lambda_handler(event, context):
                 "conversationHistory": messages
             })
         }
-        
-    except Exception as error:
-        print("Error:", str(error))
-        
+
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode('utf-8', errors='replace')
+        return {
+            "statusCode": e.code,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
+                "Access-Control-Allow-Methods": "OPTIONS,POST"
+            },
+            "body": json.dumps({
+                "success": False,
+                "error": f"HTTPError: {e.code} {e.reason}",
+                "details": error_body
+            })
+        }
+
+    except Exception as e:
         return {
             "statusCode": 500,
             "headers": {
@@ -135,6 +183,7 @@ def lambda_handler(event, context):
             },
             "body": json.dumps({
                 "success": False,
-                "error": str(error)
+                "error": str(e)
             })
         }
+
